@@ -1,153 +1,162 @@
-# Microsoft Teams Attendance Report Extractor
+# Using Microsoft Graph /me/events in Azure Logic Apps (Delegated Auth, No Admin, Non-Prod)
 
-A comprehensive solution for extracting attendance reports from Microsoft Teams meetings using Microsoft Graph API. This project provides tools for OAuth authentication, token management, and attendance data extraction.
-
-## 🎯 Problem Statement
-
-### The Challenge
-
-Microsoft Teams attendance reports are only accessible through the Microsoft Graph API, which requires:
-1. **OAuth 2.0 Authentication** - Complex authentication flows with multiple grant types
-2. **Token Management** - Access tokens expire frequently (typically every hour)
-3. **Refresh Token Flow** - Need to refresh tokens without user interaction
-4. **Azure Logic Apps Integration** - Serverless workflows need reliable token refresh mechanisms
-
-### Common Issues This Solves
-
-- **Token Expiration**: Access tokens expire quickly, breaking automated workflows
-- **Logic Apps Connector Limitations**: Built-in connectors don't support all Graph API endpoints
-- **Logic Apps Inline Code Limitations**: Can't make HTTP requests directly
-- **Token Refresh Complexity**: Difficult to implement refresh pattern in Logic Apps
-
-### What This Solution Addresses
-
-✅ **Works around Logic Apps connector limitations** - Access any Graph API endpoint via HTTP actions  
-✅ **Solves token expiration issues** - Automatic token refresh pattern  
-✅ **Simplifies authentication** - Clear patterns for service account authentication  
-✅ **Handles Logic Apps constraints** - HTTP Action + Inline Code pattern that works within limitations  
-
-⚠️ **Important**: This solution does NOT bypass required permissions. You still need proper Azure AD app registration, required API permissions granted, and valid credentials.
-
-## 💡 Solution Overview
-
-This project provides:
-1. **Python Scripts** for initial authentication and token generation
-2. **Token Refresh Mechanism** for automated token renewal
-3. **Azure Logic Apps Integration** patterns for serverless workflows
-4. **Email Parsing** to extract meeting information from Teams invitations
-
-## 🚀 Use Cases
-
-- **Automated Attendance Tracking** - Track attendance for recurring meetings, training sessions, or interviews
-- **Compliance and Reporting** - Generate attendance reports for compliance audits or HR requirements
-- **Interview Scheduling and Tracking** - Track candidate attendance, identify no-shows
-- **Training Session Management** - Monitor training session attendance and engagement
-- **Meeting Analytics** - Analyze meeting participation patterns
-- **Automated Workflows in Logic Apps** - Integrate attendance data into business processes
-
-## 📋 Architecture
+This repository documents a working, non-production approach to call:
 
 ```
-Email Parser → OAuth Flow → Token Refresh → Graph API → Attendance Reports
+GET https://graph.microsoft.com/v1.0/me/events/{eventId}
 ```
 
-## 🔧 Components
+from Azure Logic Apps, using delegated permissions and refresh tokens, **without admin consent**.
 
-### Core Scripts
-- `get_credentials_simple.py` - Get initial credentials using Resource Owner Password Credentials Grant
-- `refresh_token.py` - Refresh access tokens using refresh token
-- `main.py` - Complete workflow orchestrator for attendance extraction
-- `setup_env.py` - Interactive script to set up environment variables
+This is especially useful for PoCs, testing, and non-production systems, where admin access is unavailable.
 
-### Supporting Modules
-- `auth.py` - OAuth authentication handler
-- `config.py` - Configuration management
-- `email_parser.py` - Parse HTML emails to extract meeting information
-- `graph_client.py` - Microsoft Graph API client for fetching attendance
+## ❓ The Problem
 
-### Logic Apps Integration
-- `logic_app_refresh_token_clean.js` - Inline code for formatting bearer tokens (use after HTTP action)
+Many developers run into this situation:
 
-## 📖 Quick Start
+- They want to call Microsoft Graph `/me/events`
+- They are using Azure Logic Apps
+- They do **not** have admin consent
+- They try:
+  - username/password (ROPC)
+  - browser tokens
+  - Graph Explorer tokens
+- Things work briefly… then break randomly
 
-### Step 1: Set Up Environment Variables
+**Common errors:**
+- `invalid_client`
+- `invalid_grant`
+- `AADSTS65001`
+- `/me` works in Postman but not in Logic Apps
 
-1. Copy the example environment file:
-   ```bash
-   cp .env.example .env
-   ```
+Microsoft documentation explains pieces of this — but not the full picture.
 
-2. Edit `.env` with your Azure AD credentials:
-   ```env
-   TENANT_ID=your_tenant_id
-   CLIENT_ID=your_client_id
-   CLIENT_SECRET=your_client_secret
-   USERNAME=your_username@domain.com
-   PASSWORD=your_password
-   REDIRECT_URI=http://localhost:4200
-   SCOPE=Calendars.Read
-   ```
+## 🧠 Root Cause (The Missing Mental Model)
 
-### Step 2: Get Initial Credentials
+### 1. `/me` requires delegated permissions
+- Application permissions **cannot** call `/me`
+- Logic Apps are non-interactive
+- Delegated permissions require user consent
+
+### 2. Logic Apps cannot trigger consent
+- No UI
+- No MFA handling
+- No first-time login
+
+### 3. ROPC (username/password) is deprecated
+- Blocked by MFA
+- Blocked by Conditional Access
+- Unreliable and insecure
+
+**So the real blocker is:**
+
+> Delegated consent must happen **once, interactively**, before Logic Apps can work
+
+## ✅ The Working Solution (Non-Prod / Testing)
+
+The solution is:
+
+1. Do **one interactive consent** as the user → capture a refresh token
+2. Use that refresh token in Logic Apps
+
+**No admin required** (as long as permissions allow user consent).
+
+## 🧩 Prerequisites
+
+- **Azure App Registration**
+- **Delegated permissions:**
+  - `Calendars.Read` or `Calendars.ReadWrite`
+  - Permission must **not** require admin consent
+- **A real Entra ID user** (example: `hiringautomation.user@company.com`)
+
+## 🔑 Step 1 — One-Time Interactive Consent (Browser)
+
+Open this URL in a browser (Incognito recommended):
+
+```
+https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/authorize
+?client_id={CLIENT_ID}
+&response_type=code
+&redirect_uri=https://localhost
+&response_mode=query
+&scope=offline_access Calendars.Read
+&prompt=consent
+```
+
+1. Log in as the target user
+2. Accept the consent screen
+3. Copy the `code` from the redirect URL
+
+## 🔄 Step 2 — Exchange Code for Tokens
+
+Call the token endpoint:
+
+```
+POST https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token
+Content-Type: application/x-www-form-urlencoded
+```
+
+**Body:**
+```
+client_id={CLIENT_ID}
+&client_secret={CLIENT_SECRET}
+&grant_type=authorization_code
+&code={AUTH_CODE}
+&redirect_uri=https://localhost
+```
+
+**Response includes:**
+- `access_token`
+- `refresh_token` ← **this is what Logic Apps will use**
+
+### Quick Start: Get Credentials
+
+We provide a Python script to automate this process:
 
 ```bash
+# 1. Set up environment variables
+cp .env.example .env
+# Edit .env with your Azure AD credentials
+
+# 2. Get initial credentials (includes refresh token)
 python get_credentials_simple.py
 ```
 
-This generates and saves:
-- `tenantId`
-- `clientId`
-- `clientSecret`
-- `refreshToken`
+This will output your `refresh_token` which you'll use in Logic Apps.
 
-The refresh token will be saved to `credentials.txt` and can be added to `.env` as `REFRESH_TOKEN`.
+## ⚙️ Step 3 — Logic App: Refresh Access Token
 
-### Step 3: Refresh Token (Python)
+Inside your Logic App:
 
-```bash
-python refresh_token.py
+### HTTP Action
+
+**Method:** `POST`
+
+**URI:**
+```
+https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token
 ```
 
-### Step 4: Use in Logic Apps
-
-See "Azure Logic Apps Integration" section below for detailed steps.
-
-## 🛠️ Azure Logic Apps Integration
-
-### The Problem
-
-- Logic Apps inline code cannot make HTTP requests directly
-- Access tokens expire after ~1 hour, breaking workflows
-- Built-in connectors don't support all Graph API endpoints
-
-### The Solution: HTTP Action + Inline Code Pattern
-
-**Step 1: Configure HTTP Action for Token Refresh**
-
-**Action Name**: `Refresh_Access_Token`
-
-**Method**: `POST`
-
-**URI**: 
-```
-https://login.microsoftonline.com/@{variables('TenantId')}/oauth2/v2.0/token
-```
-
-**Headers**:
+**Headers:**
 ```
 Content-Type: application/x-www-form-urlencoded
 ```
 
-**Body** (raw):
+**Body:**
 ```
-grant_type=refresh_token&client_id=@{variables('ClientId')}&client_secret=@{variables('ClientSecret')}&refresh_token=@{variables('RefreshToken')}&scope=Calendars.Read
+grant_type=refresh_token
+&client_id=@{variables('ClientId')}
+&client_secret=@{variables('ClientSecret')}
+&refresh_token=@{variables('RefreshToken')}
+&scope=https://graph.microsoft.com/.default
 ```
 
-**Step 2: Add Inline Code to Format Bearer Token**
+This returns a fresh `access_token`.
 
-**Action Name**: `Format_Bearer_Token`
+### Format Bearer Token (Inline Code)
 
-**Code**:
+After the HTTP action, add an **Inline Code** action:
+
 ```javascript
 // Get access token from HTTP response
 const accessToken = workflowContext.actions.Refresh_Access_Token.outputs.body.access_token;
@@ -161,39 +170,105 @@ if (!accessToken) {
 return `Bearer ${accessToken}`;
 ```
 
-**Step 3: Use Bearer Token in Graph API Calls**
+**Note:** Store credentials in Logic App variables or Azure Key Vault for security.
 
-**Action Name**: `Get_Attendance_Report`
+⚠️ **Refresh tokens may rotate.** For short-term testing, you can ignore this and reuse the same one.
 
-**Method**: `GET`
+## 📅 Step 4 — Call Microsoft Graph /me/events/{id}
 
-**URI**: 
+Add another HTTP action:
+
+**Method:** `GET`
+
+**URI:**
 ```
-https://graph.microsoft.com/v1.0/me/onlineMeetings/{meetingId}/attendanceReports
+https://graph.microsoft.com/v1.0/me/events/{EVENT_ID}
 ```
 
-**Headers**:
+**Headers:**
 ```
 Authorization: @{body('Format_Bearer_Token')}
-Content-Type: application/json
+Accept: application/json
 ```
 
-### Logic App Variables Setup
+This returns the event successfully.
 
-1. Go to Logic App → Variables
-2. Add variables:
-   - `TenantId`: Your Azure AD tenant ID
-   - `ClientId`: Your app registration client ID
-   - `ClientSecret`: Your app registration client secret
-   - `RefreshToken`: Your refresh token (update when it expires)
+## 🚨 Important Limitations
 
-**Alternative**: Use Azure Key Vault for production environments.
+This approach is:
 
-### Why This Pattern Works
+### ✅ Good for:
+- PoCs
+- Testing
+- Non-production automation
+- Short-lived workflows
 
-1. **Logic Apps Limitation**: Inline code can't make HTTP requests directly
-2. **Solution**: Use HTTP action + inline code to format result
-3. **Benefit**: Clean separation, easy to maintain, reusable pattern
+### ❌ Not suitable for:
+- Production
+- MFA-protected users
+- Long-running unattended automations
+
+**Why?**
+- Refresh tokens can be revoked
+- MFA or password changes break it
+- Logic Apps can't re-consent automatically
+
+## 🟢 Production-Correct Alternative
+
+For production systems, use:
+
+```
+GET /users/{userId}/events/{eventId}
+```
+
+With:
+- **Application permissions**
+- **Admin consent**
+
+This is the only supported long-term approach.
+
+## 🧠 Key Takeaways
+
+- `/me` ⇒ delegated permissions only
+- Logic Apps ⇒ non-interactive
+- ROPC ⇒ deprecated and unreliable
+- **One-time interactive consent is the missing link**
+- Refresh tokens enable delegated auth in automation (temporarily)
+
+## 📦 What's Included
+
+This repository provides:
+
+- **Python scripts** to get initial credentials and refresh tokens
+- **Logic Apps integration patterns** (HTTP action + inline code)
+- **Example code** for token refresh in Logic Apps
+- **Complete documentation** of the authentication flow
+
+### Files
+
+- `get_credentials_simple.py` - Get initial credentials using Resource Owner Password Credentials Grant
+- `refresh_token.py` - Refresh access tokens using refresh token
+- `logic_app_refresh_token_clean.js` - Inline code for Logic Apps to format bearer tokens
+- `main.py` - Example workflow for extracting attendance reports
+- `auth.py`, `config.py`, `graph_client.py` - Supporting modules
+
+## 📖 Quick Start
+
+1. **Set up environment variables:**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your credentials
+   ```
+
+2. **Get refresh token:**
+   ```bash
+   python get_credentials_simple.py
+   ```
+
+3. **Use in Logic Apps:**
+   - Add HTTP action to refresh token (Step 3)
+   - Add inline code to format bearer token
+   - Call Graph API with bearer token (Step 4)
 
 ## 🔐 Security Best Practices
 
@@ -202,19 +277,6 @@ Content-Type: application/json
 - **Rotate secrets regularly** - Update client secrets periodically
 - **Use managed identities** - When possible, use Azure Managed Identity
 - **Store tokens securely** - Use Azure Key Vault or secure variables in Logic Apps
-
-## 📊 Output Format
-
-Attendance reports are saved as JSON with:
-- Meeting information (ID, passcode, join link)
-- Attendance records (participants, join/leave times, duration)
-- Metadata (extraction timestamp, meeting organizer)
-
-## 🔄 Token Lifecycle
-
-1. **Initial Authentication**: Get refresh token (long-lived, ~90 days)
-2. **Token Refresh**: Use refresh token to get new access token (short-lived, ~1 hour)
-3. **Automatic Renewal**: Refresh token before expiration in automated workflows
 
 ## 📝 Requirements
 
@@ -228,6 +290,17 @@ Attendance reports are saved as JSON with:
 - [Microsoft Graph API Documentation](https://learn.microsoft.com/en-us/graph/api/resources/onlinemeeting)
 - [OAuth 2.0 in Azure AD](https://learn.microsoft.com/en-us/azure/active-directory/develop/v2-oauth2-auth-code-flow)
 - [Azure Logic Apps Documentation](https://learn.microsoft.com/en-us/azure/logic-apps/)
+
+## 📌 Why This Exists
+
+This guide exists because:
+
+- Microsoft docs don't explain this end-to-end
+- Many teams hit this exact wall
+- Errors are misleading
+- The fix is simple once you understand the model
+
+**If this helped you, consider ⭐ starring the repo so others can find it.**
 
 ## 📄 License
 
